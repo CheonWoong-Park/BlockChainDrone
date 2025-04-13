@@ -1,4 +1,4 @@
-# 🚁 BlockChainDrone
+# BlockChainDrone
 
 HotStuff 합의 알고리즘이 적용된 프라이빗 블록체인 기반 드론 
 

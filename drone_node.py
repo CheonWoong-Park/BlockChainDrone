@@ -6,6 +6,7 @@ import threading
 import time
 from config import *
 from contract_integration import ContractManager
+cm = ContractManager()
 
 app = Flask(__name__)
 node_id = None
@@ -48,15 +49,21 @@ def handle_propose():
     data = request.json
     qc = data.get("justify")
     view = data.get("view")
-    digest = get_digest(data['command'])
+    command = data.get("command")
+    digest = get_digest(command)
 
     global locked_qc
     if locked_qc and qc and qc.get('view', -1) < locked_qc.get('view', -1):
-        print(f"[드론 {node_id}] 🔒 QC Lock 위반, 블록 거절!")
+        print(f"[드론 {node_id}] 🔒 QC Lock 위반, 블록 거절! (view={view})")
         return jsonify({"status": "locked_reject"})
 
+    # 🔐 블록체인에서 실제 유효성 검증 이벤트가 존재하는지 확인
+    if not cm.is_command_logged(command['sender'], command['operation']):
+        print(f"[드론 {node_id}] ❌ 체인에 기록되지 않은 명령, vote 거절!")
+        return jsonify({"status": "unverified_command"})
+
     print(f"[드론 {node_id}] 📨 블록 제안 수락됨, view={view}, digest={digest}")
-    log.append({"type": "propose", "digest": digest, "view": view, "command": data['command'], "justify": qc})
+    log.append({"type": "propose", "digest": digest, "view": view, "command": command, "justify": qc})
 
     if not is_leader(view):
         print(f"[드론 {node_id}] 🕊️ vote 준비 중... (view={view})")
@@ -66,6 +73,7 @@ def handle_propose():
         threading.Thread(target=broadcast_propose, args=(data,)).start()
 
     return jsonify({"status": "propose_received"})
+
 
 @app.route('/vote', methods=['POST'])
 def handle_vote():
@@ -111,17 +119,6 @@ def handle_commit():
         "command": command  # 🔥 실제 명령 포함
     }
     chain.append(block)
-
-    try:
-        if command and is_leader(view):
-            cm = ContractManager()
-            operation = command.get("operation", "")
-            x = command.get("x", 0)
-            y = command.get("y", 0)
-            cm.commit_block(view, digest, operation, x, y)
-            print(f"[드론 {node_id}] ⛓️ 블록체인에 저장 완료 (view={view}, digest={digest})")
-    except Exception as e:
-        print(f"[드론 {node_id}] ⚠️ 블록체인 저장 실패: {e}")
 
     print(f"[드론 {node_id}] 🔥 블록 커밋됨! digest={digest}, view={view} → 체인 길이: {len(chain)})")
     return jsonify({"status": "commit_received", "qc": locked_qc})

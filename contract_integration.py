@@ -29,3 +29,22 @@ class ContractManager:
         ).transact({'from': self.default_account})
         receipt = self.w3.eth.wait_for_transaction_receipt(tx)
         return receipt
+    
+    def is_command_logged(self, sender, operation):
+        try:
+            latest = self.w3.eth.block_number
+            from_block = max(latest - 2, 0)  # 🔥 최근 2블록 전부터만 확인
+
+            event_filter = self.contract.events.CommandValidated.createFilter(
+                fromBlock=from_block,
+                toBlock='latest',
+                argument_filters={
+                    'sender': self.w3.toChecksumAddress(sender),
+                    'operation': operation
+                }
+            )
+            events = event_filter.get_all_entries()
+            return len(events) > 0
+        except Exception as e:
+            print(f"[Contract] ❌ Failed to query CommandValidated logs: {e}")
+            return False

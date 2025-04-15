@@ -12,7 +12,7 @@ app = Flask(__name__)
 node_id = None
 my_node_url = None
 log = []
-chain = []  # 🔗 실제 블록체인 체인 구조
+chain = []
 locked_qc = None
 last_voted_view = -1
 
@@ -57,19 +57,18 @@ def handle_propose():
         print(f"[드론 {node_id}] 🔒 QC Lock 위반, 블록 거절! (view={view})")
         return jsonify({"status": "locked_reject"})
 
-    # 🔐 블록체인에서 실제 유효성 검증 이벤트가 존재하는지 확인
     if not cm.is_command_logged(command['sender'], command['operation']):
         print(f"[드론 {node_id}] ❌ 체인에 기록되지 않은 명령, vote 거절!")
         return jsonify({"status": "unverified_command"})
 
-    print(f"[드론 {node_id}] 📨 블록 제안 수락됨, view={view}, digest={digest}")
+    print(f"[드론 {node_id}] 블록 제안 수락됨, view={view}, digest={digest}")
     log.append({"type": "propose", "digest": digest, "view": view, "command": command, "justify": qc})
 
     if not is_leader(view):
-        print(f"[드론 {node_id}] 🕊️ vote 준비 중... (view={view})")
+        print(f"[드론 {node_id}] vote 준비 중... (view={view})")
         threading.Thread(target=send_vote, args=(digest, view)).start()
     else:
-        print(f"[드론 {node_id}] 👑 나는 리더다 (view={view}), propose 브로드캐스트 중...")
+        print(f"[드론 {node_id}] 리더 드론 (view={view}), propose 브로드캐스트 중...")
         threading.Thread(target=broadcast_propose, args=(data,)).start()
 
     return jsonify({"status": "propose_received"})
@@ -132,7 +131,7 @@ def broadcast_propose(propose_data):
     for nid, url in DRONE_NODES.items():
         if url != my_node_url:
             try:
-                print(f"[드론 {node_id}] 📡 propose 전송 중 → {url}")
+                print(f"[드론 {node_id}] propose 전송 중 → {url}")
                 requests.post(f"{url}/propose", json=propose_data)
             except Exception as e:
                 print(f"[드론 {node_id}] ❌ propose 전송 실패: {url}, 에러: {e}")
@@ -147,7 +146,7 @@ def send_vote(digest, view):
     leader_id = view % len(DRONE_NODES)
     leader_url = DRONE_NODES[leader_id]
     try:
-        print(f"[드론 {node_id}] 📬 리더에게 vote 전송 중 → {leader_url} (view={view})")
+        print(f"[드론 {node_id}] 리더에게 vote 전송 중 → {leader_url} (view={view})")
         response = requests.post(f"{leader_url}/vote", json=vote)
         print(f"[드론 {node_id}] ✅ vote 전송 성공 → {response.status_code} {response.text}")
     except Exception as e:
@@ -169,5 +168,5 @@ def ping():
 if __name__ == "__main__":
     node_id = int(input("드론 ID를 입력하세요 (0-2): "))
     my_node_url = DRONE_NODES[node_id]
-    print(f"[드론 {node_id}] 🛫 준비 완료. 리더는 view % {len(DRONE_NODES)} 기준으로 동적으로 결정됨.")
+    print(f"[드론 {node_id}] 준비 완료.")
     app.run(port=5000 + node_id, threaded=True)

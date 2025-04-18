@@ -1,12 +1,9 @@
-from flask import Flask, jsonify, request
-import requests
-import hashlib
-import json
-import threading
-import time
+from flask import Flask, request, jsonify
+import requests, json, hashlib, threading, datetime
 from config import *
-from contract_integration import ContractManager
-cm = ContractManager()
+from web3 import Web3
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 app = Flask(__name__)
 node_id = None
@@ -14,159 +11,210 @@ my_node_url = None
 log = []
 chain = []
 locked_qc = None
-last_voted_view = -1
+vote_pool = {}
+DRONE_PRIVATE_KEY = None
+DRONE_ACCOUNT = None
 
-# --- 유틸 함수 ---
+def log_event(message):
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [드론 {node_id}] {message}", flush=True)
+
 def is_leader(view):
     return node_id == (view % len(DRONE_NODES))
 
-def get_digest(data):
-    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+def quorum():
+    return max((len(DRONE_NODES) * 2) // 3, 1)
 
-# --- QC 관련 ---
-def make_qc(digest, view):
-    votes = [entry for entry in log if entry.get('type') == 'vote' and entry.get('digest') == digest and entry.get('view') == view]
-    quorum_size = max((len(DRONE_NODES) * 2) // 3, 1)
-    if len(votes) >= quorum_size:
-        return {"view": view, "digest": digest, "signatures": ["sig" for _ in votes]}  # 서명은 간략화
-    return None
+def get_digest(command):
+    return hashlib.sha256(json.dumps(command, sort_keys=True).encode()).hexdigest()
 
-# --- 메시지 카운트 ---
-def vote_count(digest, view):
-    seen = set()
-    count = 0
-    for entry in log:
-        if entry.get('type') == 'vote' and entry.get('digest') == digest and entry.get('view') == view:
-            sender = entry.get('sender')
-            if sender and sender not in seen:
-                seen.add(sender)
-                count += 1
-    return count
+def record_vote(view, stage, sender):
+    vote_pool.setdefault(view, {}).setdefault(stage, set()).add(sender)
 
-# --- 핸들러 ---
-@app.route('/propose', methods=['POST'])
+def vote_count(view, stage):
+    return len(vote_pool.get(view, {}).get(stage, set()))
+
+def verify_signature(view, op, x, y, signature, sender):
+    hash = Web3.solidityKeccak(["uint256", "string", "uint256", "uint256"], [view, op, x, y])
+    eth_hash = encode_defunct(hash)
+    try:
+        recovered = Account.recover_message(eth_hash, signature=bytes.fromhex(signature.replace("0x", "")))
+        return recovered == sender
+    except Exception as e:
+        log_event(f"⚠️ 서명 복구 실패: {e}")
+        return False
+
+def sign_command(view, op, x, y):
+    hash = Web3.solidityKeccak(["uint256", "string", "uint256", "uint256"], [view, op, x, y])
+    signed = Account.sign_message(encode_defunct(hash), private_key=DRONE_PRIVATE_KEY)
+    return signed.signature.hex()
+
+def send_to_blockchain(view, command):
+    op = command["operation"]
+    x = command.get("x", 0)
+    y = command.get("y", 0)
+    sig = sign_command(view, op, x, y)
+
+    payload = {
+        "blockView": view,
+        "operation": op,
+        "x": x,
+        "y": y,
+        "signature": sig,
+        "sender": DRONE_ACCOUNT.address
+    }
+
+    try:
+        res = requests.post(f"{COMMANDER_ADDR}/commitBlockWithSig", json=payload)
+        log_event(f"🔗 블록체인 커밋 요청 완료 → {res.status_code}")
+    except Exception as e:
+        log_event(f"❌ 블록체인 커밋 실패: {e}")
+
+@app.route("/propose", methods=["POST"])
 def handle_propose():
     data = request.json
-    qc = data.get("justify")
-    view = data.get("view")
-    command = data.get("command")
+    view = data["view"]
+    command = data["command"]
+    sender = data["sender"]
+    sig = data["signature"]
     digest = get_digest(command)
 
-    global locked_qc
-    if locked_qc and qc and qc.get('view', -1) < locked_qc.get('view', -1):
-        print(f"[드론 {node_id}] 🔒 QC Lock 위반, 블록 거절! (view={view})")
-        return jsonify({"status": "locked_reject"})
+    log.append({
+        "type": "propose",
+        "view": view,
+        "command": command,
+        "sender": sender,
+        "signature": sig,
+        "digest": digest
+    })
+    log_event(f"📩 리더가 제안 수신 (view={view}) → pre-prepare 브로드캐스트")
 
-    if not cm.is_command_logged(command['sender'], command['operation']):
-        print(f"[드론 {node_id}] ❌ 체인에 기록되지 않은 명령, vote 거절!")
-        return jsonify({"status": "unverified_command"})
+    if is_leader(view):
+        for url in DRONE_NODES.values():
+            if url != my_node_url:
+                try:
+                    requests.post(f"{url}/pre-prepare", json=data)
+                except Exception as e:
+                    log_event(f"⚠️ pre-prepare 전송 실패 → {url}: {e}")
+    return jsonify({"status": "propose_processed"})
 
-    print(f"[드론 {node_id}] 블록 제안 수락됨, view={view}, digest={digest}")
-    log.append({"type": "propose", "digest": digest, "view": view, "command": command, "justify": qc})
+@app.route("/pre-prepare", methods=["POST"])
+def handle_preprepare():
+    data = request.json
+    view = data["view"]
+    command = data["command"]
+    sender = data["sender"]
+    sig = data["signature"]
+    digest = get_digest(command)
+
+    log.append({
+        "type": "pre-prepare",
+        "view": view,
+        "command": command,
+        "sender": sender,
+        "signature": sig,
+        "digest": digest
+    })
 
     if not is_leader(view):
-        print(f"[드론 {node_id}] vote 준비 중... (view={view})")
-        threading.Thread(target=send_vote, args=(digest, view)).start()
-    else:
-        print(f"[드론 {node_id}] 리더 드론 (view={view}), propose 브로드캐스트 중...")
-        threading.Thread(target=broadcast_propose, args=(data,)).start()
+        if verify_signature(view, command["operation"], command.get("x", 0), command.get("y", 0), sig, sender):
+            log_event(f"✅ pre-prepare 서명 검증 성공 → vote 전송")
+            vote = {"view": view, "digest": digest, "from": DRONE_ACCOUNT.address}
+            leader_url = DRONE_NODES[view % len(DRONE_NODES)]
+            requests.post(f"{leader_url}/vote/prepare", json=vote)
+        else:
+            log_event(f"❌ pre-prepare 서명 검증 실패")
+    return jsonify({"status": "pre-prepare_processed"})
 
-    return jsonify({"status": "propose_received"})
+@app.route("/vote/prepare", methods=["POST"])
+def handle_prepare_vote():
+    vote = request.json
+    view = vote["view"]
+    sender = vote["from"]
+    record_vote(view, "prepare", sender)
 
+    log_event(f"🗳️ prepare 투표 수신 (view={view}) → {vote_count(view, 'prepare')}개")
 
-@app.route('/vote', methods=['POST'])
-def handle_vote():
+    if is_leader(view) and vote_count(view, "prepare") >= quorum():
+        log_event(f"✅ prepareQC 생성 완료 → pre-commit 전파")
+        msg = {"view": view}
+        for url in DRONE_NODES.values():
+            requests.post(f"{url}/pre-commit", json=msg)
+    return jsonify({"status": "prepare_vote_received"})
+
+@app.route("/pre-commit", methods=["POST"])
+def handle_precommit():
     data = request.json
-    if 'sender' not in data:
-        data['sender'] = request.remote_addr or f"drone_{node_id}"
-    return process_vote(data, external=True)
+    view = data["view"]
 
-def process_vote(data, external=False):
-    digest = data['digest']
-    view = data['view']
-    sender = data.get('sender', f"drone_{node_id}")
-    log.append({"type": "vote", "digest": digest, "view": view, "sender": sender})
-    count = vote_count(digest, view)
-    quorum_size = max((len(DRONE_NODES) * 2) // 3, 1)
-    print(f"[드론 {node_id}] 🗳️ {digest} (view={view}) ← {sender} | 총 투표 수: {count}")
-    if is_leader(view) and count >= quorum_size:
-        qc = make_qc(digest, view)
-        print(f"[드론 {node_id}] ✅ QC 생성 완료! digest={digest}, view={view}")
-        threading.Thread(target=broadcast_commit, args=(digest, qc, view)).start()
-    if external:
-        return jsonify({"status": "vote_received"})
+    if not is_leader(view):
+        vote = {"view": view, "from": DRONE_ACCOUNT.address}
+        leader_url = DRONE_NODES[view % len(DRONE_NODES)]
+        requests.post(f"{leader_url}/vote/precommit", json=vote)
+        log_event(f"📥 pre-commit 브로드캐스트 수신 (view={view})")
+    return jsonify({"status": "precommit_received"})
 
-@app.route('/commit', methods=['POST'])
+@app.route("/vote/precommit", methods=["POST"])
+def handle_precommit_vote():
+    vote = request.json
+    view = vote["view"]
+    sender = vote["from"]
+    record_vote(view, "precommit", sender)
+
+    log_event(f"🗳️ precommit 투표 수신 (view={view}) → {vote_count(view, 'precommit')}개")
+
+    if is_leader(view) and vote_count(view, "precommit") >= quorum():
+        log_event(f"✅ commitQC 생성 완료 → commit 전파")
+        msg = {"view": view}
+        for url in DRONE_NODES.values():
+            requests.post(f"{url}/commit", json=msg)
+    return jsonify({"status": "precommit_vote_received"})
+
+@app.route("/commit", methods=["POST"])
 def handle_commit():
     data = request.json
-    digest = data.get('digest')
-    qc = data.get('qc') or {}
-    view = qc.get('view', -1)
+    view = data["view"]
     global locked_qc
-    locked_qc = qc
+    locked_qc = {"view": view}
 
-    command = None
+    block = None
     for entry in log:
-        if entry["digest"] == digest and entry["view"] == view and entry["type"] == "propose":
-            command = entry.get("command")
+        if entry["view"] == view and entry["type"] in ["propose", "pre-prepare"]:
+            block = {
+                "view": view,
+                "digest": entry["digest"],
+                "qc": locked_qc,
+                "command": entry["command"]
+            }
             break
 
-    block = {
-        "view": view,
-        "digest": digest,
-        "qc": qc,
-        "command": command  # 🔥 실제 명령 포함
-    }
-    chain.append(block)
+    if block:
+        chain.append(block)
+        log_event(f"🔐 블록 커밋 완료! view={view}, digest={block['digest']}")
+        if is_leader(view):
+            send_to_blockchain(view, block["command"])
+        return jsonify({"status": "commit_applied", "qc": locked_qc})
+    else:
+        log_event(f"⚠️ 커밋 실패: 블록 없음")
+        return jsonify({"status": "commit_failed"})
 
-    print(f"[드론 {node_id}] 🔥 블록 커밋됨! digest={digest}, view={view} → 체인 길이: {len(chain)})")
-    return jsonify({"status": "commit_received", "qc": locked_qc})
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "alive", "id": node_id})
 
-@app.route('/chain', methods=['GET'])
+@app.route("/chain", methods=["GET"])
 def get_chain():
     return jsonify(chain)
 
-# --- propose 브로드캐스트 ---
-def broadcast_propose(propose_data):
-    for nid, url in DRONE_NODES.items():
-        if url != my_node_url:
-            try:
-                print(f"[드론 {node_id}] propose 전송 중 → {url}")
-                requests.post(f"{url}/propose", json=propose_data)
-            except Exception as e:
-                print(f"[드론 {node_id}] ❌ propose 전송 실패: {url}, 에러: {e}")
-
-# --- vote 전송 ---
-def send_vote(digest, view):
-    vote = {
-        "view": view,
-        "digest": digest,
-        "sender": f"drone_{node_id}"
-    }
-    leader_id = view % len(DRONE_NODES)
-    leader_url = DRONE_NODES[leader_id]
-    try:
-        print(f"[드론 {node_id}] 리더에게 vote 전송 중 → {leader_url} (view={view})")
-        response = requests.post(f"{leader_url}/vote", json=vote)
-        print(f"[드론 {node_id}] ✅ vote 전송 성공 → {response.status_code} {response.text}")
-    except Exception as e:
-        print(f"[드론 {node_id}] ❌ vote 전송 실패: {e}")
-
-# --- 커밋 전송 ---
-def broadcast_commit(digest, qc, view):
-    commit_msg = {"digest": digest, "qc": qc}
-    for nid, url in DRONE_NODES.items():
-        try:
-            requests.post(f"{url}/commit", json=commit_msg)
-        except Exception as e:
-            print(f"[드론 {node_id}] ❌ commit 전송 실패: {url}, 에러: {e}")
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"status": "alive", "node_id": node_id})
-
 if __name__ == "__main__":
-    node_id = int(input("드론 ID를 입력하세요 (0-2): "))
+    node_id = int(input("드론 ID 입력 (0~2): "))
     my_node_url = DRONE_NODES[node_id]
-    print(f"[드론 {node_id}] 준비 완료.")
-    app.run(port=5000 + node_id, threaded=True)
+
+    def load_key(id):
+        with open(f"keys/drone{id}.hsm", "rb") as f:
+            return f.read()
+
+    DRONE_PRIVATE_KEY = load_key(node_id)
+    DRONE_ACCOUNT = Account.from_key(DRONE_PRIVATE_KEY)
+    log_event(f"계정 주소: {DRONE_ACCOUNT.address}")
+    app.run(port=5000 + node_id)

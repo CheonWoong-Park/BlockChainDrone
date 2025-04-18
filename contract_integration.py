@@ -4,47 +4,26 @@ from config import CONTRACT_ADDRESS
 
 class ContractManager:
     def __init__(self):
-        self.w3 = Web3(Web3.HTTPProvider('http://localhost:8545'))  # 로컬 블록체인 노드
+        self.w3 = Web3(Web3.HTTPProvider('http://localhost:8545'))
         with open('DroneConsensus.json') as f:
             contract_abi = json.load(f)['abi']
         self.contract = self.w3.eth.contract(
             address=CONTRACT_ADDRESS,
             abi=contract_abi
         )
-        self.default_account = self.w3.eth.accounts[0]
-        self.w3.eth.default_account = self.default_account
 
-    def validate_command(self, sender, operation):
-        tx = self.contract.functions.validateCommand(sender, operation).transact()
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx)
-        return receipt.status == 1
-
-    def commit_block(self, view, digest, operation, x, y):
-        tx = self.contract.functions.commitBlock(
-            view,
-            digest,
-            operation,
-            x,
-            y
-        ).transact({'from': self.default_account})
+    def commit_block_with_sig(self, blockView, operation, x, y, signature, signer_address):
+        tx = self.contract.functions.commitBlockWithSig(
+            blockView, operation, x, y, bytes.fromhex(signature.replace("0x", ""))
+        ).transact({'from': signer_address})
         receipt = self.w3.eth.wait_for_transaction_receipt(tx)
         return receipt
-    
-    def is_command_logged(self, sender, operation):
-        try:
-            latest = self.w3.eth.block_number
-            from_block = max(latest - 2, 0)  # 🔥 최근 2블록 전부터만 확인
 
-            event_filter = self.contract.events.CommandValidated.createFilter(
-                fromBlock=from_block,
-                toBlock='latest',
-                argument_filters={
-                    'sender': self.w3.toChecksumAddress(sender),
-                    'operation': operation
-                }
-            )
-            events = event_filter.get_all_entries()
-            return len(events) > 0
+
+
+    def is_authorized(self, address):
+        try:
+            return self.contract.functions.isAuthorized(address).call()
         except Exception as e:
-            print(f"[Contract] ❌ Failed to query CommandValidated logs: {e}")
+            print(f"[Contract] ❌ Failed to check authorization: {e}")
             return False
